@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Öğrenci — Sesli QR Yoklama</title>
+<link rel="manifest" href="manifest-student.json" />
+<meta name="theme-color" content="#2e7d32" />
+<script src="https://unpkg.com/qrcode@1.5.3/build/qrcode.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, Arial, sans-serif; margin: 0; background:#f1f8e9; color:#1b1b1b; }
+  header { background:#2e7d32; color:#fff; padding:14px; text-align:center; font-size:18px; font-weight:600; }
+  main { padding:14px; max-width:520px; margin:auto; }
+  .card { background:#fff; border-radius:12px; padding:14px; margin-bottom:12px; box-shadow:0 2px 8px rgba(0,0,0,.08); }
+  h2 { font-size:15px; margin:0 0 10px; color:#2e7d32; }
+  button { padding:10px 14px; border-radius:8px; border:none; background:#2e7d32; color:#fff; font-size:14px; cursor:pointer; margin:4px 4px 4px 0; }
+  button:disabled { background:#9aa5b1; cursor:not-allowed; }
+  button.danger { background:#c62828; }
+  input { padding:10px; border-radius:8px; border:1px solid #ccc; font-size:14px; width:100%; margin:4px 0 8px; }
+  .status { font-size:13px; color:#555; margin:6px 0; min-height:18px; }
+  #qrBox { text-align:center; padding:10px; background:#fff; border:2px dashed #2e7d32; border-radius:12px; margin-top:8px; min-height:160px; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:6px; }
+  #qrCanvas { display:none; }
+  #qrImg { width:220px; height:220px; }
+  .detected { font-size:40px; letter-spacing:8px; color:#2e7d32; font-weight:700; font-family:"Courier New",monospace; text-align:center; }
+  .code-hint { font-size:12px; color:#777; }
+  .manual { display:flex; gap:6px; }
+  .manual input { flex:1; }
+</style>
+</head>
+<body>
+<header>📱 Öğrenci Uygulaması — Sesli QR Yoklama</header>
+<main>
+  <div class="card">
+    <h2>Öğrenci Bilgisi</h2>
+    <label>Öğrenci Numaranız</label>
+    <input id="studentNo" placeholder="Örn: 2024001" />
+  </div>
+
+  <div class="card">
+    <h2>Ses Dinleme</h2>
+    <div class="status" id="micStatus">Mikrofon kapalı</div>
+    <button id="startMic">🎤 Dinlemeyi Başlat</button>
+    <button id="stopMic" class="danger" disabled>■ Durdur</button>
+    <div class="detected" id="detected">----</div>
+    <div class="code-hint">(Hocanın sesinden algılanan 4 haneli kod)</div>
+  </div>
+
+  <div class="card">
+    <h2>QR Kodunuz</h2>
+    <div id="qrBox">
+      <img id="qrImg" alt="QR" />
+      <div id="qrPlaceholder">Kod algılanınca QR burada görünecek.</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Manuel Kod Girişi (Fallback)</h2>
+    <div class="manual">
+      <input id="manualCode" maxlength="4" inputmode="numeric" placeholder="4 haneli kod" />
+      <button id="manualBtn">QR Üret</button>
+    </div>
+  </div>
+</main>
+
+<script>
+/* ================== SABİTLER (HOCA İLE AYNI OLMALI) ================== */
+const DTMF_ROWS = [697, 770, 852, 941];
+const DTMF_COLS = [1209, 1336, 1477, 1633];
+
+/* Frekansa göre DTMF hanesi bul */
+function freqToDigit(f) {
+  // DTMF aralıklarına göre en yakın eşleşme
+  const rows = [697, 770, 852, 941];
+  const cols = [1209, 1336, 1477, 1633];
+  let ri = rows.findIndex(x => Math.abs(x - f) < 30);
+  let ci = cols.findIndex(x => Math.abs(x - f) < 30);
+  if (ri < 0 || ci < 0) return null;
+  // digit = ri*3 + ci (0..9)
+  const d = ri * 3 + ci;
+  if (d < 0 || d > 9) return null;
+  return String(d);
+}
+
+/* Goertzel: verilen frekansın gücünü ölçer */
+function goertzelMagnitude(samples, sampleRate, targetFreq) {
+  const N = samples.length;
+  const k = Math.round((N * targetFreq) / sampleRate);
+  const w = (2 * Math.PI * k) / N;
+  const cosine = Math.cos(w);
+  const coeff = 2 * cosine;
+  let q0 = 0, q1 = 0, q2 = 0;
+  for (let i = 0; i < N; i++) {
+    q0 = coeff * q1 - q2 + samples[i];
+    q2 = q1; q1 = q0;
+  }
+  const real = q1 - q2 * cosine;
+  const imag = q2 * Math.sin(w);
+  return Math.sqrt(real * real + imag * imag) / N;
+}
+
+/* ================== MİKROFON ================== */
+let audioCtx, analyser, source, mediaStream;
+let running = false;
+let lastDetectedDigit = null;
+let currentDigits = [];
+let lastDigitTime = 0;
+let currentStudentNo = localStorage.getItem('studentNo') || '';
+
+const micBtn = document.getElementById('startMic');
+const stopBtn = document.getElementById('stopMic');
+const studentNoInput = document.getElementById('studentNo');
+studentNoInput.value = currentStudentNo;
+studentNoInput.addEventListener('input', () => {
+  currentStudentNo = studentNoInput.value.trim();
+  localStorage.setItem('studentNo', currentStudentNo);
+  updateQr();
+});
+
+async function startMic() {
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    source = audioCtx.createMediaStreamSource(mediaStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 4096;
+    source.connect(analyser);
+    running = true;
+    micBtn.disabled = true;
+    stopBtn.disabled = false;
+    document.getElementById('micStatus').textContent = '🎤 Dinleniyor...';
+    currentDigits = [];
+    loopAnalyze();
+  } catch (e) {
+    document.getElementById('micStatus').textContent = '❌ Mikrofon açılamadı: ' + e.message;
+  }
+}
+
+function stopMic() {
+  running = false;
+  micBtn.disabled = false;
+  stopBtn.disabled = true;
+  document.getElementById('micStatus').textContent = 'Mikrofon kapalı';
+  if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+  if (audioCtx) audioCtx.close();
+}
+
+micBtn.onclick = startMic;
+stopBtn.onclick = stopMic;
+
+function loopAnalyze() {
+  if (!running) return;
+  const buf = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(buf);
+
+  // Tüm DTMF frekanslarının gücünü ölç
+  const mags = {};
+  [...DTMF_ROWS, ...DTMF_COLS].forEach(f => {
+    mags[f] = goertzelMagnitude(buf, audioCtx.sampleRate, f);
+  });
+
+  // En güçlü 2 frekansı bul
+  const sorted = Object.entries(mags).sort((a,b) => b[1] - a[1]);
+  const top1 = parseFloat(sorted[0][0]);
+  const top2 = parseFloat(sorted[1][0]);
+  const p1 = sorted[0][1], p2 = sorted[1][1];
+
+  // Sinyal yeterince güçlü mü?
+  const THRESHOLD = 0.008;
+  if (p1 > THRESHOLD && p2 > THRESHOLD) {
+    // Bir satır + bir sütun mu?
+    const isRow = f => DTMF_ROWS.includes(f);
+    const isCol = f => DTMF_COLS.includes(f);
+    let rowFreq = null, colFreq = null;
+    if (isRow(top1) && isCol(top2)) { rowFreq = top1; colFreq = top2; }
+    else if (isCol(top1) && isRow(top2)) { rowFreq = top2; colFreq = top1; }
+
+    if (rowFreq && colFreq) {
+      const ri = DTMF_ROWS.indexOf(rowFreq);
+      const ci = DTMF_COLS.indexOf(colFreq);
+      const digit = String(ri * 3 + ci);
+      const now = Date.now();
+      // Debounce: aynı haneyi 400ms içinde tekrar işleme
+      if (digit !== lastDetectedDigit || now - lastDigitTime > 900) {
+        lastDetectedDigit = digit;
+        lastDigitTime = now;
+        currentDigits.push(digit);
+        if (currentDigits.length > 4) currentDigits.shift();
+        const detected = currentDigits.join('');
+        document.getElementById('detected').textContent = detected.padEnd(4, '-');
+        if (currentDigits.length === 4) {
+          updateQr();
+          // Yeni kod için sıfırla
+          currentDigits = [];
+        }
+      }
+    }
+  }
+
+  requestAnimationFrame(loopAnalyze);
+}
+
+/* ================== QR ÜRETİMİ ================== */
+let qrInstance = null;
+function updateQr(manualCode) {
+  let code = null;
+  if (manualCode && manualCode.length === 4) {
+    code = manualCode;
+  } else if (currentDigits.length === 4) {
+    code = currentDigits.join('');
+  } else if (document.getElementById('detected').textContent.replace(/-/g,'').length === 4) {
+    code = document.getElementById('detected').textContent.replace(/-/g,'');
+  }
+
+  if (!code || code.length !== 4) return;
+  if (!currentStudentNo) {
+    document.getElementById('qrPlaceholder').textContent = 'Lütfen önce öğrenci numaranızı girin.';
+    return;
+  }
+
+  const payload = JSON.stringify({ no: currentStudentNo, code, ts: Date.now() });
+  document.getElementById('qrPlaceholder').style.display = 'none';
+  const img = document.getElementById('qrImg');
+  img.style.display = 'block';
+
+  // qrcode.js ile canvas üret, sonra img'e çevir
+  const canvas = document.createElement('canvas');
+  QRCode.toCanvas(canvas, payload, { width: 240, margin: 1 }, (err) => {
+    if (err) { console.error(err); return; }
+    img.src = canvas.toDataURL('image/png');
+  });
+}
+
+/* Manuel buton */
+document.getElementById('manualBtn').onclick = () => {
+  const v = document.getElementById('manualCode').value.trim();
+  if (v.length !== 4 || !/^\d{4}$/.test(v)) {
+    alert('4 haneli sayısal kod girin.');
+    return;
+  }
+  updateQr(v);
+};
+
+/* Service worker */
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+</script>
+</body>
+</html>
